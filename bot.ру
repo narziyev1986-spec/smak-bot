@@ -1,0 +1,221 @@
+import os
+import sqlite3
+import logging
+
+from telegram import (
+    Update, InlineKeyboardButton,
+    InlineKeyboardMarkup, ReplyKeyboardMarkup
+)
+from telegram.ext import (
+    Application, CommandHandler, CallbackQueryHandler,
+    MessageHandler, ContextTypes, filters
+)
+
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+
+logging.basicConfig(level=logging.INFO)
+
+db = sqlite3.connect("smak.db", check_same_thread=False)
+db.execute("""
+CREATE TABLE IF NOT EXISTS products (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT,
+    price INTEGER
+)
+""")
+db.execute("""
+CREATE TABLE IF NOT EXISTS orders (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    customer TEXT,
+    product TEXT,
+    quantity INTEGER,
+    total INTEGER,
+    status TEXT DEFAULT 'Yangi'
+)
+""")
+db.commit()
+
+# Dastlabki namunaviy mahsulotlar
+if db.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
+    db.executemany(
+        "INSERT INTO products(name, price) VALUES (?, ?)",
+        [
+            ("Hot-dog bulochka", 0),
+            ("Burger bulochka", 0),
+        ]
+    )
+    db.commit()
+
+pending = {}
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboard = [
+        ["🛒 Mahsulotlar"],
+        ["📦 Buyurtmalarim"]
+    ]
+    await update.message.reply_text(
+        "SMak botga xush kelibsiz!\nKerakli bo‘limni tanlang.",
+        reply_markup=ReplyKeyboardMarkup(
+            keyboard, resize_keyboard=True
+        )
+    )
+
+
+async def products(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = db.execute(
+        "SELECT id, name, price FROM products"
+    ).fetchall()
+
+    if not rows:
+        await update.message.reply_text("Hozircha mahsulot yo‘q.")
+        return
+
+    buttons = []
+    for pid, name, price in rows:
+        price_text = f"{price:,} so‘m" if price else "Narx kelishiladi"
+        buttons.append([
+            InlineKeyboardButton(
+                f"{name} — {price_text}",
+                callback_data=f"product_{pid}"
+            )
+        ])
+
+    await update.message.reply_text(
+        "Buyurtma qilmoqchi bo‘lgan mahsulotni tanlang:",
+        reply_markup=InlineKeyboardMarkup(buttons)
+    )
+
+
+async def choose_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    pid = int(query.data.split("_")[1])
+    product = db.execute(
+        "SELECT name, price FROM products WHERE id=?",
+        (pid,)
+    ).fetchone()
+
+    if not product:
+        await query.message.reply_text("Mahsulot topilmadi.")
+        return
+
+    pending[query.from_user.id] = (pid, product[0], product[1])
+
+    await query.message.reply_text(
+        f"{product[0]}\nNechta dona kerak? Sonini yozing."
+    )
+
+
+async def quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if user_id not in pending:
+        return
+
+    try:
+        count = int(update.message.text)
+        if count <= 0 or count > 100000:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("Iltimos, dona sonini to‘g‘ri yozing.")
+        return
+
+    pid, name, price = pending.pop(user_id)
+    total = count * price
+    customer = update.effective_user.full_name
+
+    db.execute(
+        """INSERT INTO orders(customer, product, quantity, total)
+           VALUES (?, ?, ?, ?)""",
+        (customer, name, count, total)
+    )
+    db.commit()
+
+    order_id = db.execute(
+        "SELECT last_insert_rowid()"
+    ).fetchone()[0]
+
+    await update.message.reply_text(
+        f"✅ Buyurtmangiz qabul qilindi!\n"
+        f"Buyurtma: #{order_id}\n"
+        f"Mahsulot: {name}\n"
+        f"Soni: {count} dona\n"
+        f"Jami: {total:,} so‘m" if price else
+        f"✅ Buyurtmangiz qabul qilindi!\n"
+        f"Buyurtma: #{order_id}\n"
+        f"Mahsulot: {name}\n"
+        f"Soni: {count} dona\nNarx kelishiladi."
+    )
+
+    if ADMIN_ID:
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"🛒 Yangi buyurtma #{order_id}\n"
+            f"Xaridor: {customer}\n"
+            f"Telegram ID: {user_id}\n"
+            f"Mahsulot: {name}\n"
+            f"Soni: {count} dona\n"
+            f"Jami: {total:,} so‘m"
+        )
+
+
+async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = db.execute(
+        "SELECT id, product, quantity, status FROM orders "
+        "WHERE customer=? ORDER BY id DESC LIMIT 10",
+        (update.effective_user.full_name,)
+    ).fetchall()
+
+    if not rows:
+        await update.message.reply_text("Sizda hali buyurtma yo‘q.")
+        return
+
+    text = "\n".join(
+        f"#{r[0]} | {r[1]} | {r[2]} dona | {r[3]}"
+        for r in rows
+    )
+    await update.message.reply_text(text)
+
+
+async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID or not ADMIN_ID:
+        await update.message.reply_text("Bu buyruq faqat administrator uchun.")
+        return
+
+    count, total = db.execute(
+        "SELECT COUNT(*), COALESCE(SUM(total), 0) FROM orders"
+    ).fetchone()
+
+    await update.message.reply_text(
+        f"📊 SMak hisoboti\n"
+        f"Buyurtmalar: {count} ta\n"
+        f"Jami savdo: {total:,} so‘m"
+    )
+
+
+async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message.text == "🛒 Mahsulotlar":
+        await products(update, context)
+    elif update.message.text == "📦 Buyurtmalarim":
+        await my_orders(update, context)
+    elif update.message.text.isdigit():
+        await quantity(update, context)
+
+
+def main():
+    if not TOKEN:
+        raise RuntimeError("BOT_TOKEN sozlanmagan!")
+
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("hisobot", report))
+    app.add_handler(CallbackQueryHandler(choose_product, pattern=r"^product_"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu))
+    app.run_polling()
+
+
+if __name__ == "__main__":
+    main()
