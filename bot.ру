@@ -1,219 +1,548 @@
 import os
 import sqlite3
 import logging
+from datetime import datetime
 
 from telegram import (
-    Update, InlineKeyboardButton,
-    InlineKeyboardMarkup, ReplyKeyboardMarkup
+    Update, InlineKeyboardButton, InlineKeyboardMarkup,
+    ReplyKeyboardMarkup
 )
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler,
     MessageHandler, ContextTypes, filters
 )
 
-TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))
+TOKEN = os.getenv("BOT_TOKEN", "").strip()
+OWNER_ID = int(os.getenv("ADMIN_ID", "0"))
+DB_PATH = os.getenv("DB_PATH", "smak.db")
 
-logging.basicConfig(level=logging.INFO)
-
-db = sqlite3.connect("smak.db", check_same_thread=False)
-db.execute("""
-CREATE TABLE IF NOT EXISTS products (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT,
-    price INTEGER
+logging.basicConfig(
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+    level=logging.INFO
 )
-""")
-db.execute("""
-CREATE TABLE IF NOT EXISTS orders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    customer TEXT,
-    product TEXT,
-    quantity INTEGER,
-    total INTEGER,
-    status TEXT DEFAULT 'Yangi'
-)
-""")
-db.commit()
+log = logging.getLogger("smak")
 
-# Dastlabki namunaviy mahsulotlar
-if db.execute("SELECT COUNT(*) FROM products").fetchone()[0] == 0:
-    db.executemany(
-        "INSERT INTO products(name, price) VALUES (?, ?)",
-        [
-            ("Hot-dog bulochka", 0),
-            ("Burger bulochka", 0),
-        ]
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
+db.row_factory = sqlite3.Row
+db.execute("PRAGMA foreign_keys = ON")
+
+
+def init_db():
+    db.executescript("""
+    CREATE TABLE IF NOT EXISTS users(
+        user_id INTEGER PRIMARY KEY,
+        full_name TEXT NOT NULL,
+        username TEXT,
+        role TEXT NOT NULL DEFAULT 'customer',
+        approved INTEGER NOT NULL DEFAULT 0,
+        blocked INTEGER NOT NULL DEFAULT 0,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS products(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        price INTEGER NOT NULL DEFAULT 0,
+        active INTEGER NOT NULL DEFAULT 1
+    );
+    CREATE TABLE IF NOT EXISTS orders(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        customer_id INTEGER,
+        customer_name TEXT NOT NULL,
+        product_id INTEGER,
+        product_name TEXT NOT NULL,
+        quantity INTEGER NOT NULL,
+        unit_price INTEGER NOT NULL,
+        total INTEGER NOT NULL,
+        status TEXT NOT NULL DEFAULT 'Yangi',
+        courier_id INTEGER,
+        created_by INTEGER,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS payments(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        order_id INTEGER NOT NULL,
+        amount INTEGER NOT NULL,
+        method TEXT NOT NULL,
+        payer_name TEXT NOT NULL,
+        recorded_by INTEGER NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS audit(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        actor_id INTEGER NOT NULL,
+        action TEXT NOT NULL,
+        details TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    """)
+    db.commit()
+
+
+def now():
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log_action(actor, action, details=""):
+    db.execute(
+        "INSERT INTO audit(actor_id,action,details,created_at) VALUES(?,?,?,?)",
+        (actor, action, details, now())
     )
     db.commit()
 
-pending = {}
+
+def get_user(uid):
+    return db.execute("SELECT * FROM users WHERE user_id=?", (uid,)).fetchone()
+
+
+def is_owner(uid):
+    return OWNER_ID != 0 and uid == OWNER_ID
+
+
+def is_staff(uid):
+    u = get_user(uid)
+    return bool(u and u["approved"] and not u["blocked"]
+                and u["role"] in ("cashier", "courier", "manager"))
+
+
+def is_active(uid):
+    u = get_user(uid)
+    return bool(is_owner(uid) or (u and not u["blocked"] and
+                (u["role"] == "customer" or u["approved"])))
+
+
+def money(n):
+    return f"{int(n):,}".replace(",", " ") + " so'm"
+
+
+def main_keyboard(uid):
+    rows = [["🛒 Mahsulotlar", "📦 Buyurtmalarim"]]
+    if is_owner(uid) or is_staff(uid):
+        rows.append(["📊 Hisobot", "🧾 To'lov qayd etish"])
+    if is_owner(uid):
+        rows.append(["⚙️ Rahbar paneli"])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+
+async def ensure_user(update: Update):
+    tg = update.effective_user
+    if not tg:
+        return
+    existing = get_user(tg.id)
+    if not existing:
+        role = "owner" if is_owner(tg.id) else "customer"
+        approved = 1 if is_owner(tg.id) else 0
+        db.execute(
+            """INSERT INTO users(user_id,full_name,username,role,approved,created_at)
+               VALUES(?,?,?,?,?,?)""",
+            (tg.id, tg.full_name, tg.username, role, approved, now())
+        )
+        db.commit()
+    else:
+        db.execute(
+            "UPDATE users SET full_name=?, username=? WHERE user_id=?",
+            (tg.full_name, tg.username, tg.id)
+        )
+        db.commit()
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    keyboard = [
-        ["🛒 Mahsulotlar"],
-        ["📦 Buyurtmalarim"]
-    ]
+    await ensure_user(update)
+    uid = update.effective_user.id
+    if not is_active(uid):
+        if is_owner(uid):
+            pass
+        else:
+            keyboard = InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔐 Ishlashga ruxsat so'rash", callback_data="request_access")
+            ]])
+            await update.message.reply_text(
+                "SMak tizimiga xush kelibsiz. Hisobchi yoki dostavchik sifatida "
+                "ishlash uchun rahbardan ruxsat so'rang.",
+                reply_markup=keyboard
+            )
+            return
     await update.message.reply_text(
-        "SMak botga xush kelibsiz!\nKerakli bo‘limni tanlang.",
-        reply_markup=ReplyKeyboardMarkup(
-            keyboard, resize_keyboard=True
-        )
+        "SMak botga xush kelibsiz!\nKerakli bo'limni tanlang.",
+        reply_markup=main_keyboard(uid)
     )
 
 
-async def products(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    rows = db.execute(
-        "SELECT id, name, price FROM products"
-    ).fetchall()
-
-    if not rows:
-        await update.message.reply_text("Hozircha mahsulot yo‘q.")
+async def request_access(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    await ensure_user(update)
+    if not OWNER_ID:
+        await q.message.reply_text("Rahbar ADMIN_ID sozlamasini kiritishi kerak.")
         return
+    u = get_user(uid)
+    text = (f"🔔 Ruxsat so'rovi\nIsm: {u['full_name']}\n"
+            f"Telegram ID: {uid}\nUsername: @{u['username'] or '-'}")
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("Hisobchi qilib tasdiqlash", callback_data=f"approve_cashier:{uid}"),
+        InlineKeyboardButton("Dostavchik qilib tasdiqlash", callback_data=f"approve_courier:{uid}")
+    ], [InlineKeyboardButton("Rad etish", callback_data=f"deny:{uid}")]])
+    await context.bot.send_message(OWNER_ID, text, reply_markup=kb)
+    await q.message.reply_text("So'rovingiz rahbarga yuborildi. Ruxsat berilishini kuting.")
 
-    buttons = []
-    for pid, name, price in rows:
-        price_text = f"{price:,} so‘m" if price else "Narx kelishiladi"
-        buttons.append([
-            InlineKeyboardButton(
-                f"{name} — {price_text}",
-                callback_data=f"product_{pid}"
-            )
-        ])
 
+async def admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    uid = q.from_user.id
+    if not is_owner(uid):
+        await q.message.reply_text("Bu amal faqat rahbar uchun.")
+        return
+    data = q.data
+    if data.startswith("approve_cashier:") or data.startswith("approve_courier:"):
+        role, target = data.split(":")
+        target_id = int(target)
+        new_role = "cashier" if role == "approve_cashier" else "courier"
+        db.execute(
+            "UPDATE users SET role=?, approved=1, blocked=0 WHERE user_id=?",
+            (new_role, target_id)
+        )
+        db.commit()
+        log_action(uid, "approve_user", f"{target_id}:{new_role}")
+        await context.bot.send_message(
+            target_id, f"✅ Раҳбар сизга рухсат берди. Ролингиз: {new_role}. /start ни босинг."
+        )
+        await q.edit_message_text(f"✅ {target_id} фойдаланувчи {new_role} сифатида тасдиқланди.")
+    elif data.startswith("deny:"):
+        target_id = int(data.split(":")[1])
+        await q.edit_message_text(f"❌ {target_id} сўрови рад этилди.")
+        await context.bot.send_message(target_id, "Раҳбар ҳозирча ишлашга рухсат бермади.")
+    elif data.startswith("block:") or data.startswith("unblock:"):
+        action, target = data.split(":")
+        target_id = int(target)
+        blocked = 1 if action == "block" else 0
+        db.execute("UPDATE users SET blocked=? WHERE user_id=?", (blocked, target_id))
+        db.commit()
+        log_action(uid, action, str(target_id))
+        await q.edit_message_text(f"Фойдаланувчи {target_id}: блок ҳолати {blocked}.")
+
+
+async def products(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = db.execute("SELECT id,name,price FROM products WHERE active=1 ORDER BY name").fetchall()
+    if not rows:
+        await update.message.reply_text("Hozircha mahsulot yo'q.")
+        return
+    buttons = [[InlineKeyboardButton(
+        f"{r['name']} — {money(r['price']) if r['price'] else 'Narx kelishiladi'}",
+        callback_data=f"product:{r['id']}"
+    )] for r in rows]
     await update.message.reply_text(
-        "Buyurtma qilmoqchi bo‘lgan mahsulotni tanlang:",
-        reply_markup=InlineKeyboardMarkup(buttons)
+        "Mahsulotni tanlang:", reply_markup=InlineKeyboardMarkup(buttons)
     )
 
 
 async def choose_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
+    q = update.callback_query
+    await q.answer()
+    row = db.execute("SELECT * FROM products WHERE id=? AND active=1",
+                     (int(q.data.split(":")[1]),)).fetchone()
+    if not row:
+        await q.message.reply_text("Mahsulot topilmadi.")
+        return
+    context.user_data["pending_product"] = row["id"]
+    await q.message.reply_text(f"{row['name']}\nNechta dona kerak? Faqat son yuboring.")
 
-    pid = int(query.data.split("_")[1])
-    product = db.execute(
-        "SELECT name, price FROM products WHERE id=?",
-        (pid,)
-    ).fetchone()
 
-    if not product:
-        await query.message.reply_text("Mahsulot topilmadi.")
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    msg = (update.message.text or "").strip()
+    if not is_active(uid):
+        await update.message.reply_text("Sizda ishlash uchun ruxsat yo'q. /start orqali ruxsat so'rang.")
         return
 
-    pending[query.from_user.id] = (pid, product[0], product[1])
-
-    await query.message.reply_text(
-        f"{product[0]}\nNechta dona kerak? Sonini yozing."
-    )
-
-
-async def quantity(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if user_id not in pending:
+    if msg == "🛒 Mahsulotlar":
+        await products(update, context)
         return
-
-    try:
-        count = int(update.message.text)
-        if count <= 0 or count > 100000:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("Iltimos, dona sonini to‘g‘ri yozing.")
+    if msg == "📦 Buyurtmalarim":
+        await my_orders(update, context)
         return
-
-    pid, name, price = pending.pop(user_id)
-    total = count * price
-    customer = update.effective_user.full_name
-
-    db.execute(
-        """INSERT INTO orders(customer, product, quantity, total)
-           VALUES (?, ?, ?, ?)""",
-        (customer, name, count, total)
-    )
-    db.commit()
-
-    order_id = db.execute(
-        "SELECT last_insert_rowid()"
-    ).fetchone()[0]
-
-    await update.message.reply_text(
-        f"✅ Buyurtmangiz qabul qilindi!\n"
-        f"Buyurtma: #{order_id}\n"
-        f"Mahsulot: {name}\n"
-        f"Soni: {count} dona\n"
-        f"Jami: {total:,} so‘m" if price else
-        f"✅ Buyurtmangiz qabul qilindi!\n"
-        f"Buyurtma: #{order_id}\n"
-        f"Mahsulot: {name}\n"
-        f"Soni: {count} dona\nNarx kelishiladi."
-    )
-
-    if ADMIN_ID:
-        await context.bot.send_message(
-            ADMIN_ID,
-            f"🛒 Yangi buyurtma #{order_id}\n"
-            f"Xaridor: {customer}\n"
-            f"Telegram ID: {user_id}\n"
-            f"Mahsulot: {name}\n"
-            f"Soni: {count} dona\n"
-            f"Jami: {total:,} so‘m"
+    if msg in ("📊 Hisobot", "⚙️ Rahbar paneli"):
+        if is_owner(uid) or is_staff(uid):
+            await report(update, context)
+        return
+    if msg == "🧾 To'lov qayd etish":
+        await update.message.reply_text(
+            "To'lovni qayd etish: /pay BUYURTMA_ID|SUMMA|USUL|PUL_YUBORGAN_ISM\n"
+            "Masalan: /pay 12|50000|Karta|Ali Valiyev"
         )
+        return
+
+    if msg.isdigit() and context.user_data.get("pending_product"):
+        qty = int(msg)
+        if qty < 1 or qty > 100000:
+            await update.message.reply_text("Dona sonini to'g'ri kiriting.")
+            return
+        pid = context.user_data.pop("pending_product")
+        p = db.execute("SELECT * FROM products WHERE id=?", (pid,)).fetchone()
+        total = qty * p["price"]
+        name = update.effective_user.full_name
+        cur = db.execute(
+            """INSERT INTO orders(customer_id,customer_name,product_id,product_name,
+               quantity,unit_price,total,created_by,created_at)
+               VALUES(?,?,?,?,?,?,?,?,?)""",
+            (uid, name, pid, p["name"], qty, p["price"], total, uid, now())
+        )
+        db.commit()
+        oid = cur.lastrowid
+        log_action(uid, "new_order", f"order={oid},qty={qty}")
+        price_line = f"Jami: {money(total)}" if p["price"] else "Narx kelishiladi."
+        await update.message.reply_text(
+            f"✅ Buyurtma qabul qilindi!\nRaqam: #{oid}\n{p['name']}\n"
+            f"Soni: {qty} dona\n{price_line}"
+        )
+        if OWNER_ID:
+            await context.bot.send_message(
+                OWNER_ID,
+                f"🛒 Yangi buyurtma #{oid}\nMijoz: {name}\nID: {uid}\n"
+                f"Mahsulot: {p['name']}\nSoni: {qty}\nJami: {money(total) if p['price'] else 'Kelishiladi'}"
+            )
+        return
+
+    await update.message.reply_text("Menyudan bo'lim tanlang yoki /help yuboring.")
 
 
 async def my_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
     rows = db.execute(
-        "SELECT id, product, quantity, status FROM orders "
-        "WHERE customer=? ORDER BY id DESC LIMIT 10",
-        (update.effective_user.full_name,)
+        """SELECT id,product_name,quantity,total,status FROM orders
+           WHERE customer_id=? ORDER BY id DESC LIMIT 15""", (uid,)
     ).fetchall()
-
     if not rows:
-        await update.message.reply_text("Sizda hali buyurtma yo‘q.")
+        await update.message.reply_text("Sizda hali buyurtma yo'q.")
         return
-
-    text = "\n".join(
-        f"#{r[0]} | {r[1]} | {r[2]} dona | {r[3]}"
-        for r in rows
-    )
-    await update.message.reply_text(text)
+    lines = [f"#{r['id']} | {r['product_name']} | {r['quantity']} dona | "
+             f"{money(r['total'])} | {r['status']}" for r in rows]
+    await update.message.reply_text("\n".join(lines))
 
 
 async def report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID or not ADMIN_ID:
-        await update.message.reply_text("Bu buyruq faqat administrator uchun.")
+    uid = update.effective_user.id
+    if not (is_owner(uid) or is_staff(uid)):
+        await update.message.reply_text("Ruxsat yo'q.")
         return
+    count, total = db.execute("SELECT COUNT(*),COALESCE(SUM(total),0) FROM orders").fetchone()
+    paid = db.execute("SELECT COALESCE(SUM(amount),0) FROM payments").fetchone()[0]
+    debt = max(0, total - paid)
+    text = (f"📊 SMak umumiy hisobot\nBuyurtmalar: {count} ta\n"
+            f"Jami savdo: {money(total)}\nTo'langan: {money(paid)}\n"
+            f"Qoldiq qarz: {money(debt)}")
+    if is_owner(uid):
+        staff_count = db.execute(
+            "SELECT COUNT(*) FROM users WHERE approved=1 AND role IN ('cashier','courier','manager') AND blocked=0"
+        ).fetchone()[0]
+        text += f"\nFaol xodimlar: {staff_count}"
+    await update.message.reply_text(text)
 
-    count, total = db.execute(
-        "SELECT COUNT(*), COALESCE(SUM(total), 0) FROM orders"
-    ).fetchone()
 
+async def add_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("Faqat rahbar.")
+        return
+    raw = " ".join(context.args)
+    try:
+        name, price = raw.rsplit("|", 1)
+        price = int(price.strip())
+        if price < 0 or not name.strip():
+            raise ValueError
+    except Exception:
+        await update.message.reply_text("Format: /addproduct Mahsulot nomi|Narx")
+        return
+    db.execute("INSERT INTO products(name,price) VALUES(?,?)", (name.strip(), price))
+    db.commit()
+    log_action(update.effective_user.id, "add_product", name)
+    await update.message.reply_text(f"✅ Mahsulot qo'shildi: {name.strip()} — {money(price)}")
+
+
+async def pay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    if not (is_owner(uid) or is_staff(uid)):
+        await update.message.reply_text("Faqat ruxsatli xodim to'lov qayd eta oladi.")
+        return
+    raw = " ".join(context.args)
+    try:
+        oid, amount, method, payer = raw.split("|", 3)
+        oid, amount = int(oid.strip()), int(amount.strip())
+        if amount <= 0 or not payer.strip() or not method.strip():
+            raise ValueError
+    except Exception:
+        await update.message.reply_text("Format: /pay BUYURTMA_ID|SUMMA|USUL|PUL_YUBORGAN_ISM")
+        return
+    order = db.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    if not order:
+        await update.message.reply_text("Buyurtma topilmadi.")
+        return
+    db.execute(
+        """INSERT INTO payments(order_id,amount,method,payer_name,recorded_by,created_at)
+           VALUES(?,?,?,?,?,?)""",
+        (oid, amount, method.strip(), payer.strip(), uid, now())
+    )
+    db.commit()
+    log_action(uid, "payment", f"order={oid},amount={amount},method={method},payer={payer}")
+    total_paid = db.execute("SELECT SUM(amount) FROM payments WHERE order_id=?", (oid,)).fetchone()[0] or 0
+    balance = max(0, order["total"] - total_paid)
     await update.message.reply_text(
-        f"📊 SMak hisoboti\n"
-        f"Buyurtmalar: {count} ta\n"
-        f"Jami savdo: {total:,} so‘m"
+        f"✅ To'lov qayd etildi.\nBuyurtma: #{oid}\n"
+        f"To'lov: {money(amount)} ({method})\nPul yuborgan: {payer}\n"
+        f"Buyurtma bo'yicha jami to'langan: {money(total_paid)}\nQoldiq: {money(balance)}"
+    )
+    if OWNER_ID and uid != OWNER_ID:
+        await context.bot.send_message(
+            OWNER_ID, f"💳 To'lov qayd etildi\nBuyurtma #{oid}\n"
+            f"Xodim ID: {uid}\nSumma: {money(amount)}\nUsul: {method}\n"
+            f"Karta/pul yuborgan: {payer}"
+        )
+
+
+async def assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("Faqat rahbar.")
+        return
+    try:
+        oid, courier_id = [int(x.strip()) for x in " ".join(context.args).split("|", 1)]
+    except Exception:
+        await update.message.reply_text("Format: /assign BUYURTMA_ID|DOSTAVCHIK_TELEGRAM_ID")
+        return
+    courier = get_user(courier_id)
+    if not courier or courier["role"] != "courier" or not courier["approved"] or courier["blocked"]:
+        await update.message.reply_text("Faol dostavchik topilmadi.")
+        return
+    db.execute("UPDATE orders SET courier_id=?,status='Dostavchikka berildi' WHERE id=?",
+               (courier_id, oid))
+    db.commit()
+    log_action(update.effective_user.id, "assign_courier", f"order={oid},courier={courier_id}")
+    await update.message.reply_text(f"✅ Buyurtma #{oid} dostavchikka biriktirildi.")
+    await context.bot.send_message(courier_id, f"🚚 Sizga #{oid} buyurtma biriktirildi. /mydeliveries orqali ko'ring.")
+
+
+async def my_deliveries(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    u = get_user(uid)
+    if not (u and u["role"] == "courier" and u["approved"] and not u["blocked"]):
+        await update.message.reply_text("Bu bo'lim faqat dostavchiklar uchun.")
+        return
+    rows = db.execute(
+        "SELECT id,customer_name,product_name,quantity,total,status FROM orders WHERE courier_id=? ORDER BY id DESC",
+        (uid,)
+    ).fetchall()
+    if not rows:
+        await update.message.reply_text("Sizga biriktirilgan buyurtma yo'q.")
+        return
+    await update.message.reply_text("\n".join(
+        f"#{r['id']} | {r['customer_name']} | {r['product_name']} | "
+        f"{r['quantity']} dona | {money(r['total'])} | {r['status']}" for r in rows
+    ))
+
+
+async def set_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.effective_user.id
+    u = get_user(uid)
+    if not (is_owner(uid) or (u and u["role"] == "courier" and u["approved"] and not u["blocked"])):
+        await update.message.reply_text("Ruxsat yo'q.")
+        return
+    try:
+        oid = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Format: /delivered BUYURTMA_ID")
+        return
+    order = db.execute("SELECT * FROM orders WHERE id=?", (oid,)).fetchone()
+    if not order or (not is_owner(uid) and order["courier_id"] != uid):
+        await update.message.reply_text("Buyurtma topilmadi yoki sizga biriktirilmagan.")
+        return
+    db.execute("UPDATE orders SET status='Yetkazildi' WHERE id=?", (oid,))
+    db.commit()
+    log_action(uid, "delivered", str(oid))
+    await update.message.reply_text(f"✅ Buyurtma #{oid} yetkazildi deb belgilandi.")
+    if OWNER_ID and uid != OWNER_ID:
+        await context.bot.send_message(OWNER_ID, f"📦 Buyurtma #{oid} yetkazildi. Dostavchik ID: {uid}")
+
+
+async def panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("Faqat rahbar.")
+        return
+    users = db.execute(
+        "SELECT user_id,full_name,role,approved,blocked FROM users "
+        "WHERE role!='owner' ORDER BY created_at DESC LIMIT 30"
+    ).fetchall()
+    lines = ["⚙️ Rahbar paneli", "Xodimni boshqarish: /staff ID"]
+    for u in users:
+        state = "bloklangan" if u["blocked"] else ("faol" if u["approved"] else "ruxsat kutmoqda")
+        lines.append(f"{u['full_name']} | {u['user_id']} | {u['role']} | {state}")
+    lines += [
+        "", "Buyruqlar:",
+        "/addproduct Nomi|Narx — mahsulot qo'shish",
+        "/staff ID — xodimni bloklash/ruxsatini ko'rish",
+        "/assign ORDER_ID|COURIER_ID — dostavchik biriktirish",
+        "/pay ORDER_ID|SUMMA|USUL|ISM — to'lov kiritish",
+        "/report — hisobot"
+    ]
+    await update.message.reply_text("\n".join(lines))
+
+
+async def staff(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        await update.message.reply_text("Faqat rahbar.")
+        return
+    try:
+        target = int(context.args[0])
+    except Exception:
+        await update.message.reply_text("Format: /staff TELEGRAM_ID")
+        return
+    u = get_user(target)
+    if not u:
+        await update.message.reply_text("Foydalanuvchi botga hali /start yubormagan.")
+        return
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("🔒 Bloklash", callback_data=f"block:{target}"),
+        InlineKeyboardButton("🔓 Blokdan chiqarish", callback_data=f"unblock:{target}")
+    ]])
+    await update.message.reply_text(
+        f"{u['full_name']}\nID: {target}\nRol: {u['role']}\n"
+        f"Tasdiq: {u['approved']}\nBlok: {u['blocked']}", reply_markup=kb
     )
 
 
-async def main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.message.text == "🛒 Mahsulotlar":
-        await products(update, context)
-    elif update.message.text == "📦 Buyurtmalarim":
-        await my_orders(update, context)
-    elif update.message.text.isdigit():
-        await quantity(update, context)
+async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "SMak buyruqlari:\n/start — boshlash\n"
+        "/mydeliveries — dostavchik buyurtmalari\n"
+        "/delivered ID — yetkazildi deb belgilash\n"
+        "Rahbar: /panel, /addproduct, /staff, /assign, /pay, /report"
+    )
+
+
+async def id_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"Telegram ID: {update.effective_user.id}")
 
 
 def main():
     if not TOKEN:
-        raise RuntimeError("BOT_TOKEN sozlanmagan!")
-
+        raise RuntimeError("BOT_TOKEN environment variable sozlanmagan.")
+    if not OWNER_ID:
+        raise RuntimeError("ADMIN_ID environment variable sozlanmagan.")
+    init_db()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("hisobot", report))
-    app.add_handler(CallbackQueryHandler(choose_product, pattern=r"^product_"))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, main_menu))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("id", id_cmd))
+    app.add_handler(CommandHandler("panel", panel))
+    app.add_handler(CommandHandler("addproduct", add_product))
+    app.add_handler(CommandHandler("staff", staff))
+    app.add_handler(CommandHandler("report", report))
+    app.add_handler(CommandHandler("pay", pay))
+    app.add_handler(CommandHandler("assign", assign))
+    app.add_handler(CommandHandler("mydeliveries", my_deliveries))
+    app.add_handler(CommandHandler("delivered", set_status))
+    app.add_handler(CallbackQueryHandler(request_access, pattern="^request_access$"))
+    app.add_handler(CallbackQueryHandler(admin_callback, pattern="^(approve_cashier|approve_courier|deny|block|unblock):"))
+    app.add_handler(CallbackQueryHandler(choose_product, pattern="^product:"))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+    log.info("SMak bot ishga tushmoqda")
     app.run_polling()
 
 
